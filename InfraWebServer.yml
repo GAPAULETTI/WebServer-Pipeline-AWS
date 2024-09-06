@@ -1,0 +1,887 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This stack deploy a WebServer EC2 instance(apache + php), RDS MySql database, Application Load Balancer, Automate Lambda to start and stop  resources and Cloudwatch logs.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Description: EC2 instance type
+    AllowedValues:
+      - t2.micro
+      - t2.small
+    Default: t2.micro
+  LatestAmiId:
+    Description: The ID of the region-specific Amazon Machine Image to use.
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  
+  SNSAlarmEmail:
+    Description: Email address where alarms will be send
+    Type: String
+    
+  
+  
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Can contain only ASCII characters
+  
+  SSHLocation:
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+    Default: 0.0.0.0/0
+    MinLength: "9"
+    MaxLength: "18"
+    AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+
+  MyVpcId:
+    Description: ID of the VPC 
+    Type: AWS::EC2::VPC::Id
+    
+  
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet::Id
+    Description: Choose a public subnet 
+    
+  
+  PublicSubnetTwo:
+    Type: AWS::EC2::Subnet::Id
+    Description: Choose a public subnet 
+   
+  
+  PrivateSubnetOne:
+    Type: AWS::EC2::Subnet::Id
+    Description: Choose a private subnet
+    
+  
+  PrivateSubnetTwo:
+    Type: AWS::EC2::Subnet::Id
+    Description: Choose a private subnet
+    
+  #DB Parameters
+  DBInstanceID:
+    Default: dbgpauletti
+    Description: My database instance
+    Type: String
+    MinLength: '1'
+    MaxLength: '63'
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: >-
+      Must begin with a letter and must not end with a hyphen or contain two
+      consecutive hyphens.
+  DBName:
+    Description: The database name
+    Type: String
+    Default: MyDatabase
+    MinLength: "1"
+    MaxLength: "64"
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: must begin with a letter and contain only alphanumeric characters.
+
+
+Resources:
+  
+# Creation RDS resources with security groups
+  MyRDSSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+        Name: 'DBSecret2'
+        Description: 'Secret with dynamically generated password.'
+        GenerateSecretString:
+            RequireEachIncludedType: True
+            SecretStringTemplate: '{"username": "admin"}'
+            GenerateStringKey: 'password'
+            PasswordLength: 25
+            ExcludePunctuation: True
+  MyDB:
+      Type: AWS::RDS::DBInstance
+      Properties:
+        DBName: !Ref DBName
+        DBInstanceIdentifier: !Ref DBInstanceID
+        AllocatedStorage: '20'
+        DBInstanceClass: db.t3.micro
+        DBParameterGroupName: !Ref DBParameterGroup
+        Engine: 'MySQL'
+        EngineVersion: '8.0.36'
+        MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref MyRDSSecret, ':SecretString:username}}' ]]
+        MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref MyRDSSecret, ':SecretString:password}}' ]]
+        BackupRetentionPeriod: 14
+        VPCSecurityGroups:
+        - !GetAtt 'DBSecurityGroup.GroupId'
+        DBSubnetGroupName: !Ref 'DBSubnetGroup'
+        MultiAZ: false
+        Tags:
+          - Key: 'Name'
+            Value: 'MyRdsInstance'
+    
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: DBParameterGroupGP
+      Description: CFN MySQL Parameter Group.
+      Family: mysql8.0
+      Parameters:
+        collation_server: utf8_unicode_ci
+        character_set_client: utf8
+        character_set_connection: utf8
+        character_set_database: utf8
+        character_set_server: utf8
+
+  
+  SecretRDSInstanceAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+        SecretId: !Ref MyRDSSecret
+        TargetId: !Ref MyDB
+        TargetType: AWS::RDS::DBInstance
+        
+       
+  DBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'RDS DB Security Group'
+      VpcId: !Ref MyVpcId
+      SecurityGroupIngress:
+        - IpProtocol: 'tcp'
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !GetAtt WebServerSecurityGroup.GroupId
+
+  DBSubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupDescription: 'Subnet Group for RDS DB Instance'
+      SubnetIds:
+        - !Ref PrivateSubnetOne
+        - !Ref PrivateSubnetTwo
+
+# Web Server Instance
+
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref CloudWatchAgentInstanceProfile
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref WebServerSecurityGroup
+        - !Ref DBSecurityGroup
+      SubnetId: !Ref PrivateSubnetOne
+      Tags:
+        - Key: 'Name'
+          Value: 'WebServerGP'
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            sudo yum update -y
+
+            # Get the latest CloudFormation helper scripts
+            sudo yum install -y aws-cfn-bootstrap
+            
+            # Start cfn-init
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource WebServer --region ${AWS::Region}
+            
+            # cfn-init completed so signal success or not
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WebServer --region ${AWS::Region} 
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - setup
+            - configure
+        setup:
+          packages:
+            yum:
+              httpd: []
+              mariadb: []
+              php: []
+              php-mysqlnd: []
+              jq: []
+              amazon-cloudwatch-agent: []
+              awslogs: []
+          services:
+            sysvinit:
+              httpd:
+                enabled: true
+                ensureRunning: true
+        configure:
+          files:
+            "/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json":
+              content: |
+                {
+                    "agent": {
+                        "metrics_collection_interval": 60,
+                        "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log"
+                    },
+                    "metrics": {
+                        "append_dimensions": {
+                            "InstanceId": "${aws:InstanceId}"
+                        },
+                        "metrics_collected": {
+                            "mem": {
+                                "measurement": [
+                                    "mem_used_percent"
+                                ],
+                                "metrics_collection_interval": 60
+                            },
+                            "disk": {
+                                "measurement": [
+                                    "used_percent"
+                                ],
+                                "metrics_collection_interval": 60,
+                                "resources": [
+                                    "*"
+                                ]
+                            }
+                        }
+                    },
+                    "logs": {
+                        "logs_collected": {
+                            "files": {
+                                "collect_list": [
+                                    {
+                                        "file_path": "/var/log/httpd/access_log",
+                                        "log_group_name": "codedeploy-agent-websever-gp.log",
+                                        "log_stream_name": "{instance_id}"
+                                    },
+                                    {
+                                        "file_path": "/var/log/httpd/error_log",
+                                        "log_group_name": "codedeploy-agent-websever-gp.log",
+                                        "log_stream_name": "{instance_id}"
+                                    },   
+                                    {
+                                        "file_path": "/var/log/cloud-init-output.log",
+                                        "log_group_name": "codedeploy-agent-websever-gp.log",
+                                        "log_stream_name": "{instance_id}"
+                                    }  
+                                ]
+                            }
+                        }
+                    }
+                }
+              mode: "000644"
+              owner: "root"
+              group: "root"
+            "/var/www/html/index.php":
+              content: |
+                <?php include "../inc/dbinfo.inc"; ?>
+                <html>
+                <body>
+                <h1>Sample page</h1>
+                <?php
+
+                  /* Connect to MySQL and select the database. */
+                  $connection = mysqli_connect(DB_SERVER, DB_USERNAME, DB_PASSWORD);
+
+                  if (mysqli_connect_errno()) echo "Failed to connect to MySQL: " . mysqli_connect_error();
+
+                  $database = mysqli_select_db($connection, DB_DATABASE);
+
+                  /* Ensure that the EMPLOYEES table exists. */
+                  VerifyEmployeesTable($connection, DB_DATABASE);
+
+                  /* If input fields are populated, add a row to the EMPLOYEES table. */
+                  $employee_name = htmlentities($_POST['NAME']);
+                  $employee_address = htmlentities($_POST['ADDRESS']);
+
+                  if (strlen($employee_name) || strlen($employee_address)) {
+                    AddEmployee($connection, $employee_name, $employee_address);
+                  }
+                ?>
+
+                <!-- Input form -->
+                <form action="<?PHP echo $_SERVER['SCRIPT_NAME'] ?>" method="POST">
+                  <table border="0">
+                    <tr>
+                      <td>NAME</td>
+                      <td>ADDRESS</td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <input type="text" name="NAME" maxlength="45" size="30" />
+                      </td>
+                      <td>
+                        <input type="text" name="ADDRESS" maxlength="90" size="60" />
+                      </td>
+                      <td>
+                        <input type="submit" value="Add Data" />
+                      </td>
+                    </tr>
+                  </table>
+                </form>
+
+                <!-- Display table data. -->
+                <table border="1" cellpadding="2" cellspacing="2">
+                  <tr>
+                    <td>ID</td>
+                    <td>NAME</td>
+                    <td>ADDRESS</td>
+                  </tr>
+
+                <?php
+
+                $result = mysqli_query($connection, "SELECT * FROM EMPLOYEES");
+
+                while($query_data = mysqli_fetch_row($result)) {
+                  echo "<tr>";
+                  echo "<td>",$query_data[0], "</td>",
+                      "<td>",$query_data[1], "</td>",
+                      "<td>",$query_data[2], "</td>";
+                  echo "</tr>";
+                }
+                ?>
+
+                </table>
+
+                <!-- Clean up. -->
+                <?php
+
+                  mysqli_free_result($result);
+                  mysqli_close($connection);
+
+                ?>
+
+                </body>
+                </html>
+
+
+                <?php
+
+                /* Add an employee to the table. */
+                function AddEmployee($connection, $name, $address) {
+                  $n = mysqli_real_escape_string($connection, $name);
+                  $a = mysqli_real_escape_string($connection, $address);
+
+                  $query = "INSERT INTO EMPLOYEES (NAME, ADDRESS) VALUES ('$n', '$a');";
+
+                  if(!mysqli_query($connection, $query)) echo("<p>Error adding employee data.</p>");
+                }
+
+                /* Check whether the table exists and, if not, create it. */
+                function VerifyEmployeesTable($connection, $dbName) {
+                  if(!TableExists("EMPLOYEES", $connection, $dbName))
+                  {
+                    $query = "CREATE TABLE EMPLOYEES (
+                        ID int(11) UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                        NAME VARCHAR(45),
+                        ADDRESS VARCHAR(90)
+                      )";
+
+                    if(!mysqli_query($connection, $query)) echo("<p>Error creating table.</p>");
+                  }
+                }
+
+                /* Check for the existence of a table. */
+                function TableExists($tableName, $connection, $dbName) {
+                  $t = mysqli_real_escape_string($connection, $tableName);
+                  $d = mysqli_real_escape_string($connection, $dbName);
+
+                  $checktable = mysqli_query($connection,
+                      "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_NAME = '$t' AND TABLE_SCHEMA = '$d'");
+
+                  if(mysqli_num_rows($checktable) > 0) return true;
+
+                  return false;
+                }
+                ?>                        
+                
+              mode: "000644"
+              owner: "apache"
+              group: "apache"
+          commands:
+            01_setup_cloudwatch:
+              command: |
+                wget https://amazoncloudwatch-agent.s3.amazonaws.com/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+
+                amazon-linux-extras install -y collectd
+
+                /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+            02_db_credentials:
+              command: !Sub |
+
+                SECRET=$(aws secretsmanager get-secret-value --secret-id ${MyRDSSecret} --region ${AWS::Region} --query SecretString --output text)
+                DB_USER=$(echo $SECRET | jq -r '.username')
+                DB_PASS=$(echo $SECRET | jq -r '.password')
+                DB_NAME=$(echo $SECRET | jq -r '.dbname')
+                DB_HOST=${MyDB.Endpoint.Address}
+
+                sudo mkdir /var/www/inc
+                sudo chmod 777 /var/www/inc
+
+                echo "<?php" | tee -a /var/www/inc/dbinfo.inc
+                echo "define('DB_SERVER', '$DB_HOST');" | tee -a /var/www/inc/dbinfo.inc
+                echo "define('DB_USERNAME', '$DB_USER');" | tee -a /var/www/inc/dbinfo.inc
+                echo "define('DB_PASSWORD', '$DB_PASS');" | tee -a /var/www/inc/dbinfo.inc
+                echo "define('DB_DATABASE', '$DB_NAME');" | tee -a /var/www/inc/dbinfo.inc
+                echo "?>" | tee -a /var/www/inc/dbinfo.inc
+            03_upgrade_php_mariadb:
+              command: |
+                sudo amazon-linux-extras install -y php7.2
+                sudo amazon-linux-extras install -y mariadb10.5 
+            04_install_codedeploy_packages:
+              command: |
+                sudo yum install -y ruby 
+                sudo yum install -y wget
+                sudo wget https://aws-codedeploy-us-east-1.s3.us-east-1.amazonaws.com/latest/install
+                sudo chmod +x ./install
+                sudo ./install auto
+                sudo mkdir -p /var/www/gp-project
+
+      
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for EC2 instance - Public Access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref MyVpcId
+      Tags:
+        - Key: 'Name'
+          Value: 'WebServerSecurityGroup2'
+        
+  
+  # Instance Profile and Cloudwatch role
+
+  WebServerRoleGP:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - codedeploy.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: AllowSecretsManagerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub "${MyRDSSecret}*"
+        - PolicyName: AllowDatabaseAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds-db:connect
+                Resource: '*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonRDSFullAccess
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforAWSCodeDeploy
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+              
+  CloudWatchAgentInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties: 
+      Path: '/'
+      Roles: 
+        - Ref: 'WebServerRoleGP'
+
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: "codedeploy-agent-websever-gp.log"
+      RetentionInDays: 7
+  
+
+#Load Balancer
+
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: "false"
+      Scheme: internet-facing
+      SecurityGroups:
+        - Fn::GetAtt:
+            - SecurityGroupELB
+            - GroupId
+      Subnets:
+        - !Ref PublicSubnetOne
+        - !Ref PublicSubnetTwo
+      Type: application
+      Tags:
+        - Key: 'Name'
+          Value: 'GPLoadBalancer'
+
+# SECURITY GROUP to ELB
+  SecurityGroupELB:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Load Balancer Security Group'
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow from anyone on port 443
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - CidrIp: 0.0.0.0/0
+          Description: Allow from anyone on port 80
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+      VpcId: !Ref MyVpcId
+      Tags:
+        - Key: 'Name'
+          Value: 'SG2LoadBalancer'
+
+  PublicTargetGroupLB:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckEnabled: true
+      Name: TargetLoadBalancerGPNew
+      Matcher:
+        HttpCode: 200,404,400,202,301,302,303
+      Port: 80
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: "false"
+      Targets:
+        - Id: !Ref WebServer
+          Port: 80
+      VpcId: !Ref MyVpcId
+
+  PublicListenerLB:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn:
+            Ref: PublicTargetGroupLB
+          Type: forward
+      LoadBalancerArn:
+        Ref: AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+  
+  SecurityGroupEgressLB:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId:
+        Fn::GetAtt:
+          - SecurityGroupELB
+          - GroupId
+      IpProtocol: tcp
+      Description: Load balancer to target
+      DestinationSecurityGroupId:
+        Fn::GetAtt:
+          - WebServerSecurityGroup
+          - GroupId
+      FromPort: 80
+      ToPort: 80
+   
+  SecurityGroupIngressLB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      Description: Load balancer to target
+      FromPort: 80
+      GroupId:
+        Fn::GetAtt:
+          - WebServerSecurityGroup
+          - GroupId
+      SourceSecurityGroupId:
+        Fn::GetAtt:
+          - SecurityGroupELB
+          - GroupId
+      ToPort: 80
+      
+#Lambda function to stop instances
+  LambdaStopResources:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code: 
+        ZipFile: !Sub |
+          import boto3
+
+          region = '${AWS::Region}'
+          rds_instance = '${DBInstanceID}'
+          rds_client = boto3.client('rds', region_name=region)
+          ec2_instance = ['${WebServer}']
+          ec2 = boto3.client('ec2', region_name=region)
+
+          def lambda_handler(event, context):
+            ec2.stop_instances(InstanceIds=ec2_instance)
+            print("The instance: " + str(ec2_instance) + " is being stopped.")
+            rds_client.stop_db_instance(DBInstanceIdentifier=rds_instance)
+            print("RDS Instance: " + str(rds_instance) + " is being stopped.")
+            
+          
+            return {
+                'statusCode': 200,
+                'body': 'EC2 and RDS instances is being stopped'
+            }
+      Runtime: python3.9  
+      Tags:
+        - Key: 'Name'
+          Value: 'StopResourcesGP'
+
+  LambdaStartResources:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code: 
+        ZipFile: !Sub |
+          import boto3
+
+          region = '${AWS::Region}'
+          rds_instance = '${DBInstanceID}'
+          rds_client = boto3.client('rds', region_name=region)
+          ec2_instance = ['${WebServer}']
+          ec2 = boto3.client('ec2', region_name=region)
+
+          def lambda_handler(event, context):
+            ec2.start_instances(InstanceIds=ec2_instance)
+            print("The instance: " + str(ec2_instance) + " is being started.")
+            rds_client.start_db_instance(DBInstanceIdentifier=rds_instance)
+            print("RDS Instance: " + str(rds_instance) + " is being started.")
+            
+          
+            return {
+                'statusCode': 200,
+                'body': 'EC2 and RDS instances is being started'
+            }
+      Runtime: python3.9  
+      Tags:
+        - Key: 'Name'
+          Value: 'StartResourcesGP'
+  
+  ScheduleStopEC2RDSResources:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: !Sub |
+          import boto3
+
+          def lambda_handler(event, context):
+              tag_key = 'aws:cloudformation:stack-name'
+              tag_value = '${AWS::StackName}'
+              
+              ec2 = boto3.client('ec2')
+              rds = boto3.client('rds')
+              
+              # Stopping EC2 instances
+              instances = ec2.describe_instances(
+                  Filters=[
+                      {
+                          'Name': 'tag:' + tag_key,
+                          'Values': [tag_value]
+                      }
+                  ]
+              )
+              for reservation in instances['Reservations']:
+                  for instance in reservation['Instances']:
+                      ec2.stop_instances(InstanceIds=[instance['InstanceId']])
+              
+              # Stopping RDS instances
+              db_instances = rds.describe_db_instances()
+              for db_instance in db_instances['DBInstances']:
+                  tags = rds.list_tags_for_resource(ResourceName=db_instance['DBInstanceArn'])['TagList']
+                  for tag in tags:
+                      if tag['Key'] == tag_key and tag['Value'] == tag_value:
+                          rds.stop_db_instance(DBInstanceIdentifier=db_instance['DBInstanceIdentifier'])
+
+      
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'LambdaEC2RDSControlPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'ec2:StartInstances'
+                  - 'ec2:StopInstances'
+                  - 'rds:StartDBInstance'
+                  - 'rds:StopDBInstance'
+                Resource:
+                  - '*'
+  
+  CloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: 'cron(0 2 ? * MON-FRI *)'
+      Targets:
+        - Arn: !GetAtt ScheduleStopEC2RDSResources.Arn
+          Id: StopInstancesFunctionTarget
+  
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScheduleStopEC2RDSResources
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt CloudWatchEventRule.Arn
+
+#SNS
+  SNSCWAlarms:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref SNSAlarmEmail
+          Protocol: email
+      Tags: 
+        - Key: Name
+          Value: SNSTopicGP
+
+# Cloudwatch WebServer Alarms
+
+  CPUAlarmGP:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: CPU alarm for my instance
+      AlarmActions:
+        - !Ref SNSCWAlarms
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: 2
+      Threshold: '90'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+      - Name: InstanceId
+        Value: !Ref WebServer
+  
+  CloudwatchMemoryAlarmGP:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alarm when WebServer memory exceeds 90%
+      AlarmActions:
+        - !Ref SNSCWAlarms
+      Namespace: CWAgent
+      MetricName: mem_used_percent
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref WebServer
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 5
+      Threshold: 90
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+  
+  CloudWatchAlarmDiskSpaceGP:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alarm when EC2 disk free space is less than 10%
+      AlarmActions:
+        - !Ref SNSCWAlarms
+      Namespace: CWAgent
+      MetricName: disk_used_percent
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref WebServer
+        - Name: path
+          Value: /
+        - Name: device
+          Value: xvda1
+        - Name: fstype
+          Value: xfs
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 5
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+
+#Cloudwatch RDS alarms
+
+  RDSCloudWatchCPUAlarmGP:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alarm when RDS CPU exceeds 90%
+      AlarmActions:
+        - !Ref SNSCWAlarms
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref MyDB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 90
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+
+  RDSCloudWatchAlarmRDSMemoryGP:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alarm when RDS memory exceeds 90%
+      AlarmActions:
+        - !Ref SNSCWAlarms
+      Namespace: AWS/RDS
+      MetricName: FreeableMemory
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref MyDB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 104857600 # 100 MB
+      ComparisonOperator: LessThanThreshold
+  
+# CloudWatch Alerts to Application Load Balancer
+
+  CloudWatchAlarmAppLoadBalancerGP:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alarm when the number of 5xx errors on the ELB exceeds 10 in 5 minutes
+      AlarmActions:
+        - !Ref SNSCWAlarms
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt AppLoadBalancer.LoadBalancerFullName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+  
+ 
+
+Outputs:
+  DBInstance:
+    Description: 'MySql RDS Instance Id'
+    Value: !Ref MyDB
+  WebServerInstanceId:
+    Description: "Instance Id to EC2 web server Instance"
+    Value: !Ref WebServer
+  
+  
