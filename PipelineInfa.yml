@@ -21,7 +21,7 @@ Parameters:
   SlackWebhookURL:
     Type: String
     Description: The URL of the slack webhook
-    Default: "https://hooks.slack.com/services/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"
+    
 
 Resources:
   # CodeBuild
